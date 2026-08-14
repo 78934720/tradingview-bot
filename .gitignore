@@ -39,3 +39,6 @@ coverage.xml
 
 # OS
 Thumbs.db
+.kilo/
+.png
+.mp4
