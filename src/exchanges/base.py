@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-from models import WebhookPayload
+from src.models import WebhookPayload
 
 
 @dataclass

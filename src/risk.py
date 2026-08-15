@@ -7,8 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from config import settings
-from models import WebhookPayload
+from src.config import settings
+from src.models import WebhookPayload
 
 
 @dataclass

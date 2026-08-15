@@ -8,7 +8,7 @@ import pytest
 def use_temp_db(monkeypatch):
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
-    monkeypatch.setattr("config.settings.db_path", path)
+    monkeypatch.setattr("src.config.settings.db_path", path)
     yield path
     try:
         os.unlink(path)
@@ -17,7 +17,7 @@ def use_temp_db(monkeypatch):
 
 
 def test_idempotency(use_temp_db):
-    import db
+    import src.db as db
     db.init_db()
     assert db.idempotency_seen("key1") is False
     db.idempotency_set("key1", 3600)
@@ -26,7 +26,7 @@ def test_idempotency(use_temp_db):
 
 
 def test_save_and_get_orders(use_temp_db):
-    import db
+    import src.db as db
     db.init_db()
     db.save_order("req1", "binance", "BTCUSDT", "buy", 100.0, 5, "ord-1", True, "OK")
     orders = db.get_recent_orders(10)
@@ -38,7 +38,7 @@ def test_save_and_get_orders(use_temp_db):
 
 
 def test_risk_state(use_temp_db):
-    import db
+    import src.db as db
     db.init_db()
     assert db.risk_state_get("cooldown") is None
     db.risk_state_set("cooldown", "123.45")

@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from typing import DefaultDict, List
 
-from config import settings
+from src.config import settings
 
 
 class RateLimiter:

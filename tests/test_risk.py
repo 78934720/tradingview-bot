@@ -2,7 +2,7 @@
 import pytest
 
 # Import after conftest or rely on default .env; override via monkeypatch in tests if needed
-from risk import (
+from src.risk import (
     check_symbol_allowed,
     check_position_size,
     check_leverage,

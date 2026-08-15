@@ -1,30 +1,18 @@
 """
-Hyperliquid connector (CCXT).
-
-Hyperliquid perps are USDC-margined with prices quoted in USDT (quanto, no
-USDC/USDT conversion applied), so USD-notional risk caps (*_USDT) map 1:1 to
-USDC. CCXT exposes perps as BASE/USDC:USDC; the TradingView-style BASEUSDT
-symbols must be mapped accordingly (TradingView HL perps may also carry a
-.P suffix, e.g. BTCUSD.P).
+Bybit connector (CCXT).
 """
 from __future__ import annotations
 
-import re
-import time
-from datetime import datetime, timezone
 from typing import Optional
 
 import ccxt
 
-from config import settings
-from exchanges.base import ExchangeBase, OrderResult
-from runtime_settings import get_use_testnet
-
-_PNL_CACHE: dict[str, list] = {}
-_PNL_CACHE_TTL_SECONDS = 60
+from src.config import settings
+from src.exchanges.base import ExchangeBase, OrderResult
+from src.runtime_settings import get_use_testnet
 
 
-class HyperliquidExchange(ExchangeBase):
+class BybitExchange(ExchangeBase):
     def __init__(self) -> None:
         self._client: Optional[ccxt.Exchange] = None
 
@@ -33,31 +21,18 @@ class HyperliquidExchange(ExchangeBase):
 
     def _get_client(self) -> ccxt.Exchange:
         if self._client is None:
-            opts = {"privateKey": settings.hyperliquid_private_key, "enableRateLimit": True}
-            if settings.hyperliquid_wallet_address:
-                opts["walletAddress"] = settings.hyperliquid_wallet_address
-            self._client = ccxt.hyperliquid(opts)
+            self._client = ccxt.bybit({
+                "apiKey": settings.bybit_api_key,
+                "secret": settings.bybit_api_secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "linear"},
+            })
             if get_use_testnet(self.name()):
                 self._client.set_sandbox_mode(True)
         return self._client
 
     def name(self) -> str:
-        return "hyperliquid"
-
-    def ccxt_symbol(self, symbol: str) -> str:
-        """TradingView-style (BTCUSDT, BTCUSDT.P, BTCUSD.P) -> HL perp symbol (BTC/USDC:USDC)."""
-        s = symbol.upper().strip()
-        if "/" in s:
-            return s
-        s = re.sub(r"\.P$", "", s)
-        for suffix in ("USDT", "USDC", "USD"):
-            if s.endswith(suffix):
-                return s[:-len(suffix)] + "/USDC:USDC"
-        return s + "/USDC:USDC"
-
-    def balance_currency(self) -> str:
-        """Hyperliquid collateral is USDC, not USDT."""
-        return "USDC"
+        return "bybit"
 
     def get_last_price(self, symbol: str) -> float:
         try:
@@ -81,24 +56,14 @@ class HyperliquidExchange(ExchangeBase):
             return 0.0, 0.0, 0.0
 
     def fetch_daily_pnl_usdt(self) -> float:
-        """Today's realized PnL (settled in USDC, ~USD) from userFills closedPnl, cached for 60s."""
-        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        cached = _PNL_CACHE.get(day_key)
-        if cached is not None and time.time() - cached[1] < _PNL_CACHE_TTL_SECONDS:
-            return cached[0]
         try:
-            client = self._get_client()
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
-            trades = client.fetch_my_trades(since=int(today_start))
-            total = 0.0
-            for t in trades or []:
-                closed_pnl = (t.get("info") or {}).get("closedPnl")
-                if closed_pnl is not None:
-                    total += float(closed_pnl)
-            _PNL_CACHE[day_key] = [total, time.time()]
-            for stale in [k for k in _PNL_CACHE if k != day_key]:
-                del _PNL_CACHE[stale]
-            return total
+            if hasattr(self._get_client(), "private_get_v5_position_closed_pnl"):
+                result = self._get_client().private_get_v5_position_closed_pnl({"category": "linear"})
+                data = (result or {}).get("result", {}).get("list", [])
+                from datetime import datetime, timezone
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                return sum(float(row.get("closedPnl", 0) or 0) for row in data if isinstance(row, dict) and str(row.get("updatedTime", ""))[:10] == today)
+            return 0.0
         except Exception:
             return 0.0
 
@@ -144,7 +109,6 @@ class HyperliquidExchange(ExchangeBase):
                 type="market",
                 side=side,
                 amount=amount,
-                price=price,
                 params={},
             )
             order_id = order.get("id") or order.get("clientOrderId") or ""
@@ -160,18 +124,19 @@ class HyperliquidExchange(ExchangeBase):
         take_profit_price: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
     ) -> OrderResult:
-        """Place TP/SL as market trigger orders (Hyperliquid only has USDC collateral; prices are USD)."""
+        """Set TP/SL on Bybit via position trading-stop API (v5)."""
         if not take_profit_price and not stop_loss_price:
             return OrderResult(success=True, message="No TP/SL to set")
         try:
             client = self._get_client()
-            client.load_markets()
-            sym = self.ccxt_symbol(symbol)
-            close_side = "sell" if side == "buy" else "buy"
-            if stop_loss_price:
-                client.create_order(sym, "market", close_side, amount_base, stop_loss_price, {"stopLossPrice": stop_loss_price, "reduceOnly": True})
+            # Bybit v5 expects symbol without slash, e.g. BTCUSDT
+            sym = symbol.replace("/", "").upper()
+            params = {"category": "linear", "symbol": sym}
             if take_profit_price:
-                client.create_order(sym, "market", close_side, amount_base, take_profit_price, {"takeProfitPrice": take_profit_price, "reduceOnly": True})
+                params["takeProfit"] = str(take_profit_price)
+            if stop_loss_price:
+                params["stopLoss"] = str(stop_loss_price)
+            client.private_post_v5_position_trading_stop(params)
             return OrderResult(success=True, message="TP/SL set")
         except Exception as e:
             return OrderResult(success=False, message=str(e))

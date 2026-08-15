@@ -5,12 +5,12 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-from config import settings
-from exchanges.base import ExchangeBase
-from exchanges.binance import BinanceExchange
-from exchanges.bybit import BybitExchange
-from exchanges.hyperliquid import HyperliquidExchange
-from exchanges.okx import OKXExchange
+from src.config import settings
+from src.exchanges.base import ExchangeBase
+from src.exchanges.binance import BinanceExchange
+from src.exchanges.bybit import BybitExchange
+from src.exchanges.hyperliquid import HyperliquidExchange
+from src.exchanges.okx import OKXExchange
 
 _registry: Dict[str, ExchangeBase] = {}
 

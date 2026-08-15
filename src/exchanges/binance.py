@@ -1,5 +1,5 @@
 """
-Bybit connector (CCXT).
+Binance Futures connector (CCXT).
 """
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from typing import Optional
 
 import ccxt
 
-from config import settings
-from exchanges.base import ExchangeBase, OrderResult
-from runtime_settings import get_use_testnet
+from src.config import settings
+from src.exchanges.base import ExchangeBase, OrderResult
+from src.runtime_settings import get_use_testnet
 
 
-class BybitExchange(ExchangeBase):
+class BinanceExchange(ExchangeBase):
     def __init__(self) -> None:
         self._client: Optional[ccxt.Exchange] = None
 
@@ -21,18 +21,20 @@ class BybitExchange(ExchangeBase):
 
     def _get_client(self) -> ccxt.Exchange:
         if self._client is None:
-            self._client = ccxt.bybit({
-                "apiKey": settings.bybit_api_key,
-                "secret": settings.bybit_api_secret,
+            self._client = ccxt.binance({
+                "apiKey": settings.binance_api_key,
+                "secret": settings.binance_api_secret,
                 "enableRateLimit": True,
-                "options": {"defaultType": "linear"},
+                "options": {
+                    "defaultType": "future",
+                },
             })
             if get_use_testnet(self.name()):
                 self._client.set_sandbox_mode(True)
         return self._client
 
     def name(self) -> str:
-        return "bybit"
+        return "binance"
 
     def get_last_price(self, symbol: str) -> float:
         try:
@@ -57,12 +59,15 @@ class BybitExchange(ExchangeBase):
 
     def fetch_daily_pnl_usdt(self) -> float:
         try:
-            if hasattr(self._get_client(), "private_get_v5_position_closed_pnl"):
-                result = self._get_client().private_get_v5_position_closed_pnl({"category": "linear"})
-                data = (result or {}).get("result", {}).get("list", [])
-                from datetime import datetime, timezone
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                return sum(float(row.get("closedPnl", 0) or 0) for row in data if isinstance(row, dict) and str(row.get("updatedTime", ""))[:10] == today)
+            client = self._get_client()
+            # Binance futures: fapiPrivateGetIncome returns list of income records
+            if hasattr(client, "fapiPrivateGetIncome"):
+                items = client.fapiPrivateGetIncome({"incomeType": "REALIZED_PNL", "limit": 100})
+                if isinstance(items, list):
+                    from datetime import datetime, timezone
+                    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+                    total = sum(float(i.get("income", 0) or 0) for i in items if float(i.get("time", 0) or 0) >= today_start)
+                    return total
             return 0.0
         except Exception:
             return 0.0
@@ -85,7 +90,8 @@ class BybitExchange(ExchangeBase):
             client = self._get_client()
             client.set_leverage(leverage, self.ccxt_symbol(symbol))
             return True
-        except Exception:
+        except Exception as e:
+            # Some exchanges ignore if already set
             return False
 
     def place_market_order(
@@ -109,7 +115,7 @@ class BybitExchange(ExchangeBase):
                 type="market",
                 side=side,
                 amount=amount,
-                params={},
+                params={"positionSide": "BOTH"},
             )
             order_id = order.get("id") or order.get("clientOrderId") or ""
             return OrderResult(success=True, order_id=str(order_id), message="Order placed")
@@ -124,19 +130,30 @@ class BybitExchange(ExchangeBase):
         take_profit_price: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
     ) -> OrderResult:
-        """Set TP/SL on Bybit via position trading-stop API (v5)."""
+        """Place STOP_MARKET and TAKE_PROFIT_MARKET orders on Binance Futures."""
         if not take_profit_price and not stop_loss_price:
             return OrderResult(success=True, message="No TP/SL to set")
+        close_side = "sell" if side == "buy" else "buy"
         try:
             client = self._get_client()
-            # Bybit v5 expects symbol without slash, e.g. BTCUSDT
-            sym = symbol.replace("/", "").upper()
-            params = {"category": "linear", "symbol": sym}
-            if take_profit_price:
-                params["takeProfit"] = str(take_profit_price)
+            client.load_markets()
+            sym = self.ccxt_symbol(symbol)
             if stop_loss_price:
-                params["stopLoss"] = str(stop_loss_price)
-            client.private_post_v5_position_trading_stop(params)
-            return OrderResult(success=True, message="TP/SL set")
+                client.create_order(
+                    symbol=sym,
+                    type="STOP_MARKET",
+                    side=close_side,
+                    amount=amount_base,
+                    params={"stopPrice": stop_loss_price, "positionSide": "BOTH", "closePosition": "false"},
+                )
+            if take_profit_price:
+                client.create_order(
+                    symbol=sym,
+                    type="TAKE_PROFIT_MARKET",
+                    side=close_side,
+                    amount=amount_base,
+                    params={"stopPrice": take_profit_price, "positionSide": "BOTH", "closePosition": "false"},
+                )
+            return OrderResult(success=True, message="TP/SL orders placed")
         except Exception as e:
             return OrderResult(success=False, message=str(e))

@@ -14,8 +14,8 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
-from config import settings
-from db import (
+from src.config import settings
+from src.db import (
     get_recent_orders,
     idempotency_seen,
     idempotency_set,
@@ -24,19 +24,19 @@ from db import (
     risk_state_set,
     save_order,
 )
-from exchanges.registry import get_exchange, get_all_exchanges, reset_all_clients
-from runtime_settings import get_effective_use_testnet, set_use_testnet_override
-from logging_config import setup_logging
-from metrics import get_all as get_metrics, inc
-from models import WebhookPayload, Side, ExchangeName
-from rate_limit import get_rate_limiter
-from ai.enhancer import enhancer_process
-from ai.advisor import advisor_review
-from ai.signals import generate_signal
-from risk import run_risk_checks
-from tpsl import amount_base_from_size_usdt, set_tp_sl_after_order
-from retry import with_retry
-from trailing_stop import add_trailing_pending, trailing_stop_loop
+from src.exchanges.registry import get_exchange, get_all_exchanges, reset_all_clients
+from src.runtime_settings import get_effective_use_testnet, set_use_testnet_override
+from src.logging_config import setup_logging
+from src.metrics import get_all as get_metrics, inc
+from src.models import WebhookPayload, Side, ExchangeName
+from src.rate_limit import get_rate_limiter
+from src.ai.enhancer import enhancer_process
+from src.ai.advisor import advisor_review
+from src.ai.signals import generate_signal
+from src.risk import run_risk_checks
+from src.tpsl import amount_base_from_size_usdt, set_tp_sl_after_order
+from src.retry import with_retry
+from src.trailing_stop import add_trailing_pending, trailing_stop_loop
 
 setup_logging(use_json=True)
 logger = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TradingView Webhook Bot", lifespan=lifespan)
 
-_DASHBOARD_PATH = Path(__file__).resolve().parent / "static" / "dashboard.html"
+_DASHBOARD_PATH = Path(__file__).resolve().parent.parent / "static" / "dashboard.html"
 
 
 @app.get("/", response_class=RedirectResponse)

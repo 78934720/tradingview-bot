@@ -150,7 +150,7 @@ The **Live / Testnet** switch in the dashboard header applies to **all** configu
 
 3. **Run**
    ```bash
-   python main.py
+   python -m src.main
    ```
    Server: `http://0.0.0.0:8000` → Webhook: `POST /webhook`
 
@@ -178,7 +178,7 @@ The **Live / Testnet** switch in the dashboard header applies to **all** configu
 
 | Path | Purpose |
 |------|---------|
-| `main.py` | Entrypoint; runs uvicorn with `server:app`. |
+| `src/main.py` | Entrypoint; runs uvicorn with `src.server:app`. |
 | `server.py` | FastAPI app: webhook, signals, health, metrics, status, dashboard, balance, exchange status, network switch. |
 | `config.py` | Pydantic settings from env (`.env`). |
 | `models.py` | `WebhookPayload`, `Side`, `ExchangeName`. |

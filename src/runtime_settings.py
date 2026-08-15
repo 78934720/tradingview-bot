@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from config import settings
+from src.config import settings
 
 _use_testnet_override: Optional[bool] = None
 

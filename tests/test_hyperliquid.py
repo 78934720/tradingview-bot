@@ -1,7 +1,7 @@
 """Tests for Hyperliquid connector symbol/currency mapping (no network)."""
-from exchanges.base import ExchangeBase
-from exchanges.binance import BinanceExchange
-from exchanges.hyperliquid import HyperliquidExchange
+from src.exchanges.base import ExchangeBase
+from src.exchanges.binance import BinanceExchange
+from src.exchanges.hyperliquid import HyperliquidExchange
 
 
 def test_hl_ccxt_symbol_perps():

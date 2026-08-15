@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from exchanges.base import ExchangeBase, OrderResult
+from src.exchanges.base import ExchangeBase, OrderResult
 
 
 def set_tp_sl_after_order(

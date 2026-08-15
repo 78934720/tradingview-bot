@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
-from config import settings
+from src.config import settings
 
 
 def _get_conn() -> sqlite3.Connection:

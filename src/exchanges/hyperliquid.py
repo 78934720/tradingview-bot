@@ -1,18 +1,30 @@
 """
-Binance Futures connector (CCXT).
+Hyperliquid connector (CCXT).
+
+Hyperliquid perps are USDC-margined with prices quoted in USDT (quanto, no
+USDC/USDT conversion applied), so USD-notional risk caps (*_USDT) map 1:1 to
+USDC. CCXT exposes perps as BASE/USDC:USDC; the TradingView-style BASEUSDT
+symbols must be mapped accordingly (TradingView HL perps may also carry a
+.P suffix, e.g. BTCUSD.P).
 """
 from __future__ import annotations
 
+import re
+import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import ccxt
 
-from config import settings
-from exchanges.base import ExchangeBase, OrderResult
-from runtime_settings import get_use_testnet
+from src.config import settings
+from src.exchanges.base import ExchangeBase, OrderResult
+from src.runtime_settings import get_use_testnet
+
+_PNL_CACHE: dict[str, list] = {}
+_PNL_CACHE_TTL_SECONDS = 60
 
 
-class BinanceExchange(ExchangeBase):
+class HyperliquidExchange(ExchangeBase):
     def __init__(self) -> None:
         self._client: Optional[ccxt.Exchange] = None
 
@@ -21,20 +33,31 @@ class BinanceExchange(ExchangeBase):
 
     def _get_client(self) -> ccxt.Exchange:
         if self._client is None:
-            self._client = ccxt.binance({
-                "apiKey": settings.binance_api_key,
-                "secret": settings.binance_api_secret,
-                "enableRateLimit": True,
-                "options": {
-                    "defaultType": "future",
-                },
-            })
+            opts = {"privateKey": settings.hyperliquid_private_key, "enableRateLimit": True}
+            if settings.hyperliquid_wallet_address:
+                opts["walletAddress"] = settings.hyperliquid_wallet_address
+            self._client = ccxt.hyperliquid(opts)
             if get_use_testnet(self.name()):
                 self._client.set_sandbox_mode(True)
         return self._client
 
     def name(self) -> str:
-        return "binance"
+        return "hyperliquid"
+
+    def ccxt_symbol(self, symbol: str) -> str:
+        """TradingView-style (BTCUSDT, BTCUSDT.P, BTCUSD.P) -> HL perp symbol (BTC/USDC:USDC)."""
+        s = symbol.upper().strip()
+        if "/" in s:
+            return s
+        s = re.sub(r"\.P$", "", s)
+        for suffix in ("USDT", "USDC", "USD"):
+            if s.endswith(suffix):
+                return s[:-len(suffix)] + "/USDC:USDC"
+        return s + "/USDC:USDC"
+
+    def balance_currency(self) -> str:
+        """Hyperliquid collateral is USDC, not USDT."""
+        return "USDC"
 
     def get_last_price(self, symbol: str) -> float:
         try:
@@ -58,17 +81,24 @@ class BinanceExchange(ExchangeBase):
             return 0.0, 0.0, 0.0
 
     def fetch_daily_pnl_usdt(self) -> float:
+        """Today's realized PnL (settled in USDC, ~USD) from userFills closedPnl, cached for 60s."""
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cached = _PNL_CACHE.get(day_key)
+        if cached is not None and time.time() - cached[1] < _PNL_CACHE_TTL_SECONDS:
+            return cached[0]
         try:
             client = self._get_client()
-            # Binance futures: fapiPrivateGetIncome returns list of income records
-            if hasattr(client, "fapiPrivateGetIncome"):
-                items = client.fapiPrivateGetIncome({"incomeType": "REALIZED_PNL", "limit": 100})
-                if isinstance(items, list):
-                    from datetime import datetime, timezone
-                    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
-                    total = sum(float(i.get("income", 0) or 0) for i in items if float(i.get("time", 0) or 0) >= today_start)
-                    return total
-            return 0.0
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+            trades = client.fetch_my_trades(since=int(today_start))
+            total = 0.0
+            for t in trades or []:
+                closed_pnl = (t.get("info") or {}).get("closedPnl")
+                if closed_pnl is not None:
+                    total += float(closed_pnl)
+            _PNL_CACHE[day_key] = [total, time.time()]
+            for stale in [k for k in _PNL_CACHE if k != day_key]:
+                del _PNL_CACHE[stale]
+            return total
         except Exception:
             return 0.0
 
@@ -90,8 +120,7 @@ class BinanceExchange(ExchangeBase):
             client = self._get_client()
             client.set_leverage(leverage, self.ccxt_symbol(symbol))
             return True
-        except Exception as e:
-            # Some exchanges ignore if already set
+        except Exception:
             return False
 
     def place_market_order(
@@ -115,7 +144,8 @@ class BinanceExchange(ExchangeBase):
                 type="market",
                 side=side,
                 amount=amount,
-                params={"positionSide": "BOTH"},
+                price=price,
+                params={},
             )
             order_id = order.get("id") or order.get("clientOrderId") or ""
             return OrderResult(success=True, order_id=str(order_id), message="Order placed")
@@ -130,30 +160,18 @@ class BinanceExchange(ExchangeBase):
         take_profit_price: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
     ) -> OrderResult:
-        """Place STOP_MARKET and TAKE_PROFIT_MARKET orders on Binance Futures."""
+        """Place TP/SL as market trigger orders (Hyperliquid only has USDC collateral; prices are USD)."""
         if not take_profit_price and not stop_loss_price:
             return OrderResult(success=True, message="No TP/SL to set")
-        close_side = "sell" if side == "buy" else "buy"
         try:
             client = self._get_client()
             client.load_markets()
             sym = self.ccxt_symbol(symbol)
+            close_side = "sell" if side == "buy" else "buy"
             if stop_loss_price:
-                client.create_order(
-                    symbol=sym,
-                    type="STOP_MARKET",
-                    side=close_side,
-                    amount=amount_base,
-                    params={"stopPrice": stop_loss_price, "positionSide": "BOTH", "closePosition": "false"},
-                )
+                client.create_order(sym, "market", close_side, amount_base, stop_loss_price, {"stopLossPrice": stop_loss_price, "reduceOnly": True})
             if take_profit_price:
-                client.create_order(
-                    symbol=sym,
-                    type="TAKE_PROFIT_MARKET",
-                    side=close_side,
-                    amount=amount_base,
-                    params={"stopPrice": take_profit_price, "positionSide": "BOTH", "closePosition": "false"},
-                )
-            return OrderResult(success=True, message="TP/SL orders placed")
+                client.create_order(sym, "market", close_side, amount_base, take_profit_price, {"takeProfitPrice": take_profit_price, "reduceOnly": True})
+            return OrderResult(success=True, message="TP/SL set")
         except Exception as e:
             return OrderResult(success=False, message=str(e))

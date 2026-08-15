@@ -10,9 +10,9 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from config import settings
-from db import get_cursor
-from exchanges.registry import get_exchange
+from src.config import settings
+from src.db import get_cursor
+from src.exchanges.registry import get_exchange
 
 logger = logging.getLogger(__name__)
 

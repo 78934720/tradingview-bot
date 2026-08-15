@@ -7,9 +7,9 @@ from typing import Optional
 
 import ccxt
 
-from config import settings
-from exchanges.base import ExchangeBase, OrderResult
-from runtime_settings import get_use_testnet
+from src.config import settings
+from src.exchanges.base import ExchangeBase, OrderResult
+from src.runtime_settings import get_use_testnet
 
 
 class OKXExchange(ExchangeBase):

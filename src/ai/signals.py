@@ -6,8 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from config import settings
-from exchanges.registry import get_exchange
+from src.config import settings
+from src.exchanges.registry import get_exchange
 
 from .llm import llm_json
 

@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 import httpx
 
-from config import settings
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 

@@ -2,7 +2,7 @@
 import pytest
 from pydantic import ValidationError
 
-from models import WebhookPayload, Side, ExchangeName
+from src.models import WebhookPayload, Side, ExchangeName
 
 
 def test_webhook_payload_minimal():

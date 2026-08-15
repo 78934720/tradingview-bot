@@ -7,8 +7,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from config import settings
-from models import WebhookPayload
+from src.config import settings
+from src.models import WebhookPayload
 
 from .llm import llm_json
 
