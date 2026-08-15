@@ -40,5 +40,7 @@ coverage.xml
 # OS
 Thumbs.db
 .kilo/
-.png
-.mp4
+*.png
+*.mp4
+strategies/
+*.pine
