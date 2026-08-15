@@ -1,8 +1,17 @@
 """
 Hyperliquid connector (CCXT).
+
+Hyperliquid perps are USDC-margined with prices quoted in USDT (quanto, no
+USDC/USDT conversion applied), so USD-notional risk caps (*_USDT) map 1:1 to
+USDC. CCXT exposes perps as BASE/USDC:USDC; the TradingView-style BASEUSDT
+symbols must be mapped accordingly (TradingView HL perps may also carry a
+.P suffix, e.g. BTCUSD.P).
 """
 from __future__ import annotations
 
+import re
+import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import ccxt
@@ -10,7 +19,9 @@ import ccxt
 from config import settings
 from exchanges.base import ExchangeBase, OrderResult
 from runtime_settings import get_use_testnet
-from utils import ccxt_symbol
+
+_PNL_CACHE: dict[str, list] = {}
+_PNL_CACHE_TTL_SECONDS = 60
 
 
 class HyperliquidExchange(ExchangeBase):
@@ -33,10 +44,25 @@ class HyperliquidExchange(ExchangeBase):
     def name(self) -> str:
         return "hyperliquid"
 
+    def ccxt_symbol(self, symbol: str) -> str:
+        """TradingView-style (BTCUSDT, BTCUSDT.P, BTCUSD.P) -> HL perp symbol (BTC/USDC:USDC)."""
+        s = symbol.upper().strip()
+        if "/" in s:
+            return s
+        s = re.sub(r"\.P$", "", s)
+        for suffix in ("USDT", "USDC", "USD"):
+            if s.endswith(suffix):
+                return s[:-len(suffix)] + "/USDC:USDC"
+        return s + "/USDC:USDC"
+
+    def balance_currency(self) -> str:
+        """Hyperliquid collateral is USDC, not USDT."""
+        return "USDC"
+
     def get_last_price(self, symbol: str) -> float:
         try:
             client = self._get_client()
-            ticker = client.fetch_ticker(ccxt_symbol(symbol))
+            ticker = client.fetch_ticker(self.ccxt_symbol(symbol))
             return float(ticker.get("last") or ticker.get("close") or 0)
         except Exception:
             return 0.0
@@ -44,7 +70,7 @@ class HyperliquidExchange(ExchangeBase):
     def get_orderbook(self, symbol: str, limit: int = 5) -> tuple[float, float, float]:
         try:
             client = self._get_client()
-            ob = client.fetch_order_book(ccxt_symbol(symbol), limit)
+            ob = client.fetch_order_book(self.ccxt_symbol(symbol), limit)
             bids = ob.get("bids") or []
             asks = ob.get("asks") or []
             bid = float(bids[0][0]) if bids else 0.0
@@ -55,7 +81,26 @@ class HyperliquidExchange(ExchangeBase):
             return 0.0, 0.0, 0.0
 
     def fetch_daily_pnl_usdt(self) -> float:
-        return 0.0
+        """Today's realized PnL (settled in USDC, ~USD) from userFills closedPnl, cached for 60s."""
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cached = _PNL_CACHE.get(day_key)
+        if cached is not None and time.time() - cached[1] < _PNL_CACHE_TTL_SECONDS:
+            return cached[0]
+        try:
+            client = self._get_client()
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+            trades = client.fetch_my_trades(since=int(today_start))
+            total = 0.0
+            for t in trades or []:
+                closed_pnl = (t.get("info") or {}).get("closedPnl")
+                if closed_pnl is not None:
+                    total += float(closed_pnl)
+            _PNL_CACHE[day_key] = [total, time.time()]
+            for stale in [k for k in _PNL_CACHE if k != day_key]:
+                del _PNL_CACHE[stale]
+            return total
+        except Exception:
+            return 0.0
 
     def fetch_total_exposure_usdt(self) -> float:
         try:
@@ -73,7 +118,7 @@ class HyperliquidExchange(ExchangeBase):
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
             client = self._get_client()
-            client.set_leverage(leverage, ccxt_symbol(symbol))
+            client.set_leverage(leverage, self.ccxt_symbol(symbol))
             return True
         except Exception:
             return False
@@ -88,7 +133,7 @@ class HyperliquidExchange(ExchangeBase):
         try:
             client = self._get_client()
             client.load_markets()
-            sym = ccxt_symbol(symbol)
+            sym = self.ccxt_symbol(symbol)
             ticker = client.fetch_ticker(sym)
             price = float(ticker.get("last") or ticker.get("close") or 1)
             if price <= 0:
@@ -99,6 +144,7 @@ class HyperliquidExchange(ExchangeBase):
                 type="market",
                 side=side,
                 amount=amount,
+                price=price,
                 params={},
             )
             order_id = order.get("id") or order.get("clientOrderId") or ""
@@ -114,18 +160,18 @@ class HyperliquidExchange(ExchangeBase):
         take_profit_price: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
     ) -> OrderResult:
-        """Place TP/SL (Hyperliquid supports trigger orders)."""
+        """Place TP/SL as market trigger orders (Hyperliquid only has USDC collateral; prices are USD)."""
         if not take_profit_price and not stop_loss_price:
             return OrderResult(success=True, message="No TP/SL to set")
         try:
             client = self._get_client()
             client.load_markets()
-            sym = ccxt_symbol(symbol)
+            sym = self.ccxt_symbol(symbol)
             close_side = "sell" if side == "buy" else "buy"
             if stop_loss_price:
-                client.create_order(sym, "stop_market", close_side, amount_base, stop_loss_price, {"triggerPrice": stop_loss_price})
+                client.create_order(sym, "market", close_side, amount_base, stop_loss_price, {"stopLossPrice": stop_loss_price, "reduceOnly": True})
             if take_profit_price:
-                client.create_order(sym, "take_profit_market", close_side, amount_base, take_profit_price, {"triggerPrice": take_profit_price})
+                client.create_order(sym, "market", close_side, amount_base, take_profit_price, {"takeProfitPrice": take_profit_price, "reduceOnly": True})
             return OrderResult(success=True, message="TP/SL set")
         except Exception as e:
             return OrderResult(success=False, message=str(e))

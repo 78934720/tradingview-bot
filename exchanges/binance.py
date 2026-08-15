@@ -10,7 +10,6 @@ import ccxt
 from config import settings
 from exchanges.base import ExchangeBase, OrderResult
 from runtime_settings import get_use_testnet
-from utils import ccxt_symbol
 
 
 class BinanceExchange(ExchangeBase):
@@ -40,7 +39,7 @@ class BinanceExchange(ExchangeBase):
     def get_last_price(self, symbol: str) -> float:
         try:
             client = self._get_client()
-            ticker = client.fetch_ticker(ccxt_symbol(symbol))
+            ticker = client.fetch_ticker(self.ccxt_symbol(symbol))
             return float(ticker.get("last") or ticker.get("close") or 0)
         except Exception:
             return 0.0
@@ -48,7 +47,7 @@ class BinanceExchange(ExchangeBase):
     def get_orderbook(self, symbol: str, limit: int = 5) -> tuple[float, float, float]:
         try:
             client = self._get_client()
-            ob = client.fetch_order_book(ccxt_symbol(symbol), limit)
+            ob = client.fetch_order_book(self.ccxt_symbol(symbol), limit)
             bids = ob.get("bids") or []
             asks = ob.get("asks") or []
             bid = float(bids[0][0]) if bids else 0.0
@@ -89,7 +88,7 @@ class BinanceExchange(ExchangeBase):
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
             client = self._get_client()
-            client.set_leverage(leverage, ccxt_symbol(symbol))
+            client.set_leverage(leverage, self.ccxt_symbol(symbol))
             return True
         except Exception as e:
             # Some exchanges ignore if already set
@@ -105,7 +104,7 @@ class BinanceExchange(ExchangeBase):
         try:
             client = self._get_client()
             client.load_markets()
-            sym = ccxt_symbol(symbol)
+            sym = self.ccxt_symbol(symbol)
             ticker = client.fetch_ticker(sym)
             price = float(ticker.get("last") or ticker.get("close") or 1)
             if price <= 0:
@@ -138,7 +137,7 @@ class BinanceExchange(ExchangeBase):
         try:
             client = self._get_client()
             client.load_markets()
-            sym = ccxt_symbol(symbol)
+            sym = self.ccxt_symbol(symbol)
             if stop_loss_price:
                 client.create_order(
                     symbol=sym,

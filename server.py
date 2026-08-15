@@ -60,8 +60,8 @@ def _balance_for_exchange(exchange_name: str) -> Optional[float]:
     try:
         client = ex._get_client()
         bal = client.fetch_balance()
-        usdt = (bal.get("USDT") or bal.get("usdt")) or {}
-        total = usdt.get("total")
+        entry = bal.get(ex.balance_currency()) or {}
+        total = entry.get("total")
         if total is not None:
             return float(total)
         return None
@@ -140,9 +140,10 @@ def _exposure_by_symbol(exchange_name: str) -> dict[str, float]:
         positions = client.fetch_positions()
         out: dict[str, float] = {}
         for p in positions or []:
-            sym = (p.get("symbol") or p.get("symbolId") or "").replace("/", "").upper()
-            if not sym:
+            raw = p.get("symbol") or p.get("symbolId") or ""
+            if not raw:
                 continue
+            sym = ex.tv_symbol(raw)
             notional = abs(float(p.get("notional", 0) or 0))
             if notional <= 0 and p.get("contracts"):
                 notional = abs(float(p.get("contracts", 0) or 0) * float(p.get("markPrice") or p.get("last", 0) or 0))
@@ -178,7 +179,7 @@ def _execute_payload(payload: WebhookPayload, request_key: str) -> tuple[int, di
     daily_pnl = _daily_pnl_for_exchange(payload.exchange.value)
     total_exposure = _exposure_for_exchange(payload.exchange.value)
     _by_sym = _exposure_by_symbol(payload.exchange.value)
-    exposure_by_symbol = lambda s: _by_sym.get(s, 0.0)
+    exposure_by_symbol = lambda s: _by_sym.get(ex.canonical_symbol(s), 0.0)
     cooldown_active = _cooldown_active()
 
     spread_bid, spread_ask, spread_mid = 0.0, 0.0, 0.0

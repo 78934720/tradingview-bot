@@ -24,6 +24,42 @@ class ExchangeBase(ABC):
     def name(self) -> str:
         pass
 
+    def ccxt_symbol(self, symbol: str) -> str:
+        """Convert TradingView-style symbol (BTCUSDT) to this exchange's CCXT symbol. Override per exchange."""
+        s = symbol.upper().strip()
+        if "/" in s:
+            return s
+        if s.endswith("USDT"):
+            return s[:-4] + "/USDT"
+        return s
+
+    def tv_symbol(self, ccxt_sym: str) -> str:
+        """Inverse of ccxt_symbol: CCXT symbol (BTC/USDC:USDC) -> TradingView-style (BTCUSDT)."""
+        s = (ccxt_sym or "").strip()
+        if "/" not in s:
+            return s.upper()
+        base = s.split("/")[0].split(":")[0].strip().upper()
+        if base:
+            return base + "USDT"
+        return s.replace("/", "").replace(":", "").upper()
+
+    def canonical_symbol(self, symbol: str) -> str:
+        """Canonical risk-lookup key (BASEUSDT) for any TradingView-style input (BTCUSD.P -> BTCUSDT).
+
+        Must be the same key tv_symbol produces so exposure maps and payload lookups match.
+        """
+        s = symbol.upper().strip()
+        if s.endswith(".P"):
+            s = s[:-2]
+        for suffix in ("USDT", "USDC", "USD"):
+            if s.endswith(suffix):
+                return s[:-len(suffix)] + "USDT"
+        return s + "USDT"
+
+    def balance_currency(self) -> str:
+        """Currency key of fetch_balance() totals (USDT on most venues, USDC on Hyperliquid)."""
+        return "USDT"
+
     def reset_client(self) -> None:
         """Clear cached client so next use recreates it (e.g. after network switch). Override if needed."""
         pass
