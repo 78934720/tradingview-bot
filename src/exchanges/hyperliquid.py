@@ -1,11 +1,14 @@
 """
 Hyperliquid connector (CCXT).
 
-Hyperliquid perps are USDC-margined with prices quoted in USDT (quanto, no
-USDC/USDT conversion applied), so USD-notional risk caps (*_USDT) map 1:1 to
-USDC. CCXT exposes perps as BASE/USDC:USDC; the TradingView-style BASEUSDT
-symbols must be mapped accordingly (TradingView HL perps may also carry a
-.P suffix, e.g. BTCUSD.P).
+Hyperliquid settles everything in USDC. Spot markets are BASE/USDC, perps are
+BASE/USDC:USDC (prices quoted in USDT, quanto, no USDC/USDT conversion), so
+USD-notional risk caps (*_USDT) map 1:1 to USDC.
+
+TradingView tickers map as: spot (BTCUSD, BTCUSDT, BTCUSDC, ...) -> BASE/USDC;
+perps carry the .P suffix (BTCUSD.P) -> BASE/USDC:USDC. resolve_symbol() is
+the network-aware variant: it prefers the spot market and falls back to the
+perp when no spot market exists (e.g. XAUUSD -> XAU/USDC:USDC).
 """
 from __future__ import annotations
 
@@ -24,6 +27,48 @@ _PNL_CACHE: dict[str, list] = {}
 _PNL_CACHE_TTL_SECONDS = 60
 
 
+class HyperliquidSigningClient(ccxt.hyperliquid):
+    """ccxt.hyperliquid subclass with a corrected L1 signer.
+
+    Stock ccxt (as of 4.5.x) signs the EIP-712 digest's hex *string* again
+    (keccak over the ASCII hex) instead of the digest itself, so Hyperliquid
+    recovers a garbage signer and rejects every signed request with
+    "User or API Wallet <random> does not exist". Sign the digest itself,
+    matching the official hyperliquid-python-sdk.
+    """
+
+    def sign_l1_action(self, action, nonce, vaultAddress=None, expiresAfter=None):
+        is_testnet = self.safe_bool(self.options, "sandboxMode", False)
+        phantom_agent = self.construct_phantom_agent(
+            self.action_hash(action, vaultAddress, nonce, expiresAfter), is_testnet
+        )
+        digest = self.eth_encode_structured_data(
+            {
+                "chainId": 1337,
+                "name": "Exchange",
+                "verifyingContract": self.safe_string(self.options, "zeroAddress"),
+                "version": "1",
+            },
+            {
+                "Agent": [
+                    {"name": "source", "type": "string"},
+                    {"name": "connectionId", "type": "bytes32"},
+                ],
+            },
+            phantom_agent,
+        )
+        # digest is b"\x19\x01" + domain separator + message hash; the signed
+        # message is keccak256 of that entire pre-image
+        signature = self.ecdsa(
+            self.hash(digest, "keccak"), self.privateKey[-64:], "secp256k1", None
+        )
+        return {
+            "r": "0x" + signature["r"],
+            "s": "0x" + signature["s"],
+            "v": self.sum(27, signature["v"]),
+        }
+
+
 class HyperliquidExchange(ExchangeBase):
     def __init__(self) -> None:
         self._client: Optional[ccxt.Exchange] = None
@@ -36,7 +81,13 @@ class HyperliquidExchange(ExchangeBase):
             opts = {"privateKey": settings.hyperliquid_private_key, "enableRateLimit": True}
             if settings.hyperliquid_wallet_address:
                 opts["walletAddress"] = settings.hyperliquid_wallet_address
-            self._client = ccxt.hyperliquid(opts)
+            self._client = HyperliquidSigningClient(opts)
+            # ccxt attaches its default builder to every order with a mixed-case
+            # address; HL hashes the builder address lowercased, so the signature
+            # never matches. Attach the same builder lowercased at 0% fee.
+            self._client.options["approvedBuilderFee"] = True
+            self._client.options["builderFee"] = False
+            self._client.options["builder"] = "0x6530512a6c89c7cfcebc3ba7fcd9ada5f30827a6"
             if get_use_testnet(self.name()):
                 self._client.set_sandbox_mode(True)
         return self._client
@@ -45,15 +96,66 @@ class HyperliquidExchange(ExchangeBase):
         return "hyperliquid"
 
     def ccxt_symbol(self, symbol: str) -> str:
-        """TradingView-style (BTCUSDT, BTCUSDT.P, BTCUSD.P) -> HL perp symbol (BTC/USDC:USDC)."""
+        """TradingView-style ticker -> HL CCXT symbol (offline, no markets lookup).
+
+        Spot (no .P suffix): BTCUSD/BTCUSDT/BTCUSDC -> BTC/USDC.
+        Perps (.P suffix, e.g. BTCUSD.P): -> BTC/USDC:USDC.
+        Symbols already containing "/" are passed through unchanged.
+        """
         s = symbol.upper().strip()
         if "/" in s:
             return s
+        perp = s.endswith(".P")
         s = re.sub(r"\.P$", "", s)
         for suffix in ("USDT", "USDC", "USD"):
             if s.endswith(suffix):
-                return s[:-len(suffix)] + "/USDC:USDC"
-        return s + "/USDC:USDC"
+                s = s[:-len(suffix)]
+                break
+        return f"{s}/USDC:USDC" if perp else f"{s}/USDC"
+
+    def resolve_symbol(self, symbol: str) -> str:
+        """Network-aware CCXT symbol: prefer the spot market (BTCUSD -> BTC/USDC),
+        fall back to the perp when no spot market exists (XAUUSD -> XAU/USDC:USDC).
+        Explicit CCXT symbols (contain "/") and .P tickers are returned as-is."""
+        s = symbol.upper().strip()
+        if "/" in s or s.endswith(".P"):
+            return self.ccxt_symbol(s)
+        client = self._get_client()
+        client.load_markets()
+        spot = self.ccxt_symbol(s)
+        if spot in client.markets:
+            return spot
+        perp = spot.replace("/USDC", "/USDC:USDC", 1)
+        return perp if perp in client.markets else spot
+
+    def _is_spot_symbol(self, symbol: str) -> bool:
+        """True if the CCXT symbol resolves to the spot market (no :QUOTE suffix)."""
+        return ":" not in symbol
+
+    def _reference_price(self, client: ccxt.Exchange, symbol: str, side: str = "buy") -> float:
+        """Last/close price from the ticker, falling back to the order book (testnet
+        spot often has no trades -> no ticker last). For a buy use the ask, for a
+        sell the bid, else the mid."""
+        try:
+            ticker = client.fetch_ticker(symbol)
+            price = float(ticker.get("last") or ticker.get("close") or 0)
+            if price > 0:
+                return price
+        except Exception:
+            pass
+        return self._book_price(client, symbol, side)
+
+    def _book_price(self, client: ccxt.Exchange, symbol: str, side: str = "buy") -> float:
+        """Best book price for a market order: ask for a buy, bid for a sell.
+        The ticker last can be stale (testnet spot), so book first."""
+        bid, ask, mid = self.get_orderbook(symbol)
+        if side == "sell" and bid:
+            return bid
+        if ask:
+            return ask
+        if bid:
+            return bid
+        return mid
 
     def balance_currency(self) -> str:
         """Hyperliquid collateral is USDC, not USDT."""
@@ -62,15 +164,14 @@ class HyperliquidExchange(ExchangeBase):
     def get_last_price(self, symbol: str) -> float:
         try:
             client = self._get_client()
-            ticker = client.fetch_ticker(self.ccxt_symbol(symbol))
-            return float(ticker.get("last") or ticker.get("close") or 0)
+            return self._reference_price(client, self.resolve_symbol(symbol))
         except Exception:
             return 0.0
 
     def get_orderbook(self, symbol: str, limit: int = 5) -> tuple[float, float, float]:
         try:
             client = self._get_client()
-            ob = client.fetch_order_book(self.ccxt_symbol(symbol), limit)
+            ob = client.fetch_order_book(self.resolve_symbol(symbol), limit)
             bids = ob.get("bids") or []
             asks = ob.get("asks") or []
             bid = float(bids[0][0]) if bids else 0.0
@@ -118,7 +219,10 @@ class HyperliquidExchange(ExchangeBase):
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
             client = self._get_client()
-            client.set_leverage(leverage, self.ccxt_symbol(symbol))
+            sym = self.resolve_symbol(symbol)
+            if self._is_spot_symbol(sym):
+                return False  # spot has no leverage
+            client.set_leverage(leverage, sym)
             return True
         except Exception:
             return False
@@ -133,12 +237,15 @@ class HyperliquidExchange(ExchangeBase):
         try:
             client = self._get_client()
             client.load_markets()
-            sym = self.ccxt_symbol(symbol)
-            ticker = client.fetch_ticker(sym)
-            price = float(ticker.get("last") or ticker.get("close") or 1)
+            sym = self.resolve_symbol(symbol)
+            price = self._book_price(client, sym, side)
+            if price <= 0:
+                price = self._reference_price(client, sym, side)
             if price <= 0:
                 return OrderResult(success=False, message="Could not get price")
-            amount = size_usdt / price
+            amount = float(client.amount_to_precision(sym, size_usdt / price))
+            if amount <= 0:
+                return OrderResult(success=False, message="Amount rounds to zero (market lot size too large)")
             order = client.create_order(
                 symbol=sym,
                 type="market",
@@ -166,7 +273,12 @@ class HyperliquidExchange(ExchangeBase):
         try:
             client = self._get_client()
             client.load_markets()
-            sym = self.ccxt_symbol(symbol)
+            sym = self.resolve_symbol(symbol)
+            if self._is_spot_symbol(sym):
+                return OrderResult(
+                    success=False,
+                    message="TP/SL trigger orders are not supported on Hyperliquid spot",
+                )
             close_side = "sell" if side == "buy" else "buy"
             if stop_loss_price:
                 client.create_order(sym, "market", close_side, amount_base, stop_loss_price, {"stopLossPrice": stop_loss_price, "reduceOnly": True})

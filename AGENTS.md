@@ -6,6 +6,8 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 
 - Run: `python src/main.py` (uvicorn `server:app`, `HOST`/`PORT` from `.env`, default 0.0.0.0:8000)
 - Tests: `pytest tests/ -q` — no test config, no fixtures/conftest; tests import repo modules directly
+- `tests/test_hyperliquid_testnet.py` hits the **Hyperliquid testnet API** (orders, cancels, TP/SL) and is skipped when `HYPERLIQUID_PRIVATE_KEY` is unset; it forces the testnet override itself, so it never touches a live account
+- Testnet USDC (faucet funds) is **finite** and spot round trips on testnet burn it (degenerate books: ETH spot bid ~50 vs ask ~150, no XAU, BTC spot is whole-BTC lots). Prefer **perps** for testnet functional tests, and use only **minimal amounts** everywhere (just above the 10 USDC min order value).
 - No linter/typecheck config exists. `.venv` uses Python 3.14; README claims 3.10+.
 
 ## Env / config gotchas
@@ -39,10 +41,12 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
   - Error responses, rate limits, signing → `/for-developers/api/error-responses`, `/for-developers/api/rate-limits-and-user-limits`, `/for-developers/api/signing`
   - Testnet funds → `/onboarding/testnet-faucet`
 - Perps are **USDC-margined**, priced in USDT (quanto) — `*_USDT` risk caps map 1:1 to USDC. `balance_currency()` returns `"USDC"`, not `"USDT"`.
-- CCXT symbols are `BASE/USDC:USDC`; `ccxt_symbol()` strips TradingView `.P` perp suffixes (`BTCUSDT.P`, `BTCUSD.P`) and accepts USDT/USDC/USD quote suffixes (`HYPEUSDC` → `HYPE/USDC:USDC`).
+- Symbol mapping (offline, `ccxt_symbol()`): **no `.P` suffix → spot `BASE/USDC`** (BTCUSD/BTCUSDT/BTCUSDC → `BTC/USDC`); **`.P` suffix → perp `BASE/USDC:USDC`**. `resolve_symbol()` is the network-aware variant: prefers the spot market, falls back to perp when no spot market exists (XAUUSD → `XAU/USDC:USDC`). Spot and perp share the `BASEUSDT` risk key.
+- **Do NOT "fix" the signing**: `HyperliquidSigningClient` (subclass of `ccxt.hyperliquid`) is required. Stock ccxt 4.5.x signs `keccak(ascii-hex(EIP-712 digest))` (double hash) and attaches its default builder with a mixed-case address; both make HL recover a garbage signer → every request fails with `User or API Wallet <random> does not exist` (the address changes per call). The subclass signs the digest itself and `_get_client()` pre-lowers the builder address.
+- Spot on Hyperliquid: **no TP/SL trigger orders yet** (HL: "Placing trigger orders is not enabled on spot trading yet"; `place_tp_sl_orders` returns `success=False` for spot), `reduceOnly` is rejected on spot, orders must be worth ≥ 10 USDC, and spot/perp USDC wallets are separate (`fetch_balance({"type": "spot"|"swap"})`, `transfer(code, amount, "swap", "spot")`). Testnet spot is degenerate: BTC/USDC has whole-BTC lot sizes (1.0 precision), XAU isn't listed, books are thin and prices decouple from perps (use the order book, not the ticker `last`, for market-order pricing) — the functional tests use ETH/USDC for spot execution.
 - Auth is `HYPERLIQUID_PRIVATE_KEY` (required; raw private key string, not a mnemonic); `HYPERLIQUID_WALLET_ADDRESS` optional. Testnet via `set_sandbox_mode(True)`.
 - Daily PnL comes from `fetch_my_trades` `info.closedPnl`, cached 60 s per UTC day (`_PNL_CACHE`).
-- TP/SL are **market trigger orders** (`{"stopLossPrice": ..., "reduceOnly": True}` / `{"takeProfitPrice": ...}`), not limit orders.
+- TP/SL are **market trigger orders** (`{"stopLossPrice": ..., "reduceOnly": True}` / `{"takeProfitPrice": ...}`), not limit orders; trigger prices are tick-rounded, and `fetch_open_orders` exposes them via `order["triggerPrice"]`.
 
 ## PineScript (strategies/*.pine)
 
