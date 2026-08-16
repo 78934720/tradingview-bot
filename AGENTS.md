@@ -4,7 +4,7 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 
 ## Commands
 
-- Run: `python -m src.main` (uvicorn `src.server:app`, `HOST`/`PORT` from `.env`, default 0.0.0.0:8000)
+- Run: `python src/main.py` (uvicorn `server:app`, `HOST`/`PORT` from `.env`, default 0.0.0.0:8000)
 - Tests: `pytest tests/ -q` — no test config, no fixtures/conftest; tests import repo modules directly
 - No linter/typecheck config exists. `.venv` uses Python 3.14; README claims 3.10+.
 
@@ -17,9 +17,9 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 
 ## Architecture / pipeline
 
-- `src/server.py` — FastAPI app and the whole webhook execution pipeline in `_execute_payload` (server.py:168): auth → idempotency → AI enhancer → risk checks (fixed order: allowlist, size cap, per-symbol cap, total exposure, leverage cap, daily-loss reject, cooldown, spread) → LLM advisor → `place_market_order` with retries → TP/SL → record trailing stop.
+- `server.py` — FastAPI app and the whole webhook execution pipeline in `_execute_payload` (server.py:168): auth → idempotency → AI enhancer → risk checks (fixed order: allowlist, size cap, per-symbol cap, total exposure, leverage cap, daily-loss reject, cooldown, spread) → LLM advisor → `place_market_order` with retries → TP/SL → record trailing stop.
 - `trailing_stop.py` runs its own background loop (`TRAILING_STOP_CHECK_INTERVAL_SECONDS`).
-- `src/main.py` is a 10-line uvicorn launcher; almost all logic lives in `src/server.py`, `src/risk.py`, `src/db.py`, `src/tpsl.py`, `src/trailing_stop.py`.
+- `main.py` is a 10-line uvicorn launcher; almost all logic lives in `server.py`, `risk.py`, `db.py`, `tpsl.py`, `trailing_stop.py` (all flat at repo root, no `src/` package).
 - Dashboard is a single static page `static/dashboard.html` (Tailwind CDN + Lightweight Charts), served by FastAPI.
 
 ## Exchange layer
@@ -30,6 +30,14 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 
 ## Hyperliquid (exchanges/hyperliquid.py)
 
+- Docs root: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api (official API reference — trust it over CCXT docs). Sitemap: `https://hyperliquid.gitbook.io/hyperliquid-docs/sitemap.xml`.
+- Direct pages for concepts this bot touches:
+  - Order placement incl. trigger orders, `stopLossPrice`/`takeProfitPrice`/`reduceOnly`, `reduceOnly` → `/for-developers/api/exchange-endpoint`
+  - Account data: balances, `userFills` (has `closedPnl`), positions/exposure → `/for-developers/api/info-endpoint` and `/for-developers/api/info-endpoint/perpetuals`
+  - TP/SL order semantics → `/trading/take-profit-and-stop-loss-orders-tp-sl`
+  - Order types, margining, contract specs (tick/lot size) → `/trading/order-types`, `/trading/margining`, `/for-developers/api/tick-and-lot-size`
+  - Error responses, rate limits, signing → `/for-developers/api/error-responses`, `/for-developers/api/rate-limits-and-user-limits`, `/for-developers/api/signing`
+  - Testnet funds → `/onboarding/testnet-faucet`
 - Perps are **USDC-margined**, priced in USDT (quanto) — `*_USDT` risk caps map 1:1 to USDC. `balance_currency()` returns `"USDC"`, not `"USDT"`.
 - CCXT symbols are `BASE/USDC:USDC`; `ccxt_symbol()` strips TradingView `.P` perp suffixes (`BTCUSDT.P`, `BTCUSD.P`) and accepts USDT/USDC/USD quote suffixes (`HYPEUSDC` → `HYPE/USDC:USDC`).
 - Auth is `HYPERLIQUID_PRIVATE_KEY` (required; raw private key string, not a mnemonic); `HYPERLIQUID_WALLET_ADDRESS` optional. Testnet via `set_sandbox_mode(True)`.
@@ -38,6 +46,15 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 
 ## PineScript (strategies/*.pine)
 
+- Docs: https://www.tradingview.com/pine-script-docs/ (Pine v5 language reference — `strategy.entry/close/exit`, `alert_message`, `request.*` calls, `timeframe.change`). No sitemap (checked robots.txt → global `sitemap.xml` only lists the docs root; index the nav tree instead). The default docs are **v6**; repo scripts are `//@version=5`, so prefix URLs with `/pine-script-docs/v5/...`.
+- Direct pages for concepts used by the strategies:
+  - `strategy.entry/close/close_all/exit`, pyramiding, order placement → `/pine-script-docs/v5/concepts/strategies`
+  - `alert_message`, `{{strategy.order.alert_message}}`, alert setup → `/pine-script-docs/v5/concepts/alerts`
+  - `request.earnings/dividends/splits`, external data → `/pine-script-docs/v5/concepts/other-timeframes-and-data`
+  - `timeframe.change`, MTF/HTF → `/pine-script-docs/v5/concepts/timeframes`; sessions/time → `/pine-script-docs/v5/concepts/sessions`, `/pine-script-docs/v5/concepts/time`
+  - Execution model (`barstate.*`, calc on every tick) → `/pine-script-docs/v5/language/execution-model`
+  - `input.*` (incl. the "Alert Message IDs" group) → `/pine-script-docs/v5/concepts/inputs`
+  - Built-in function reference (`fun_strategy.entry`, `fun_ta.vwap`, …) → https://www.tradingview.com/pine-script-reference/v5/
 - `strategies/` is **gitignored** (`*.pine`) — these files are not part of the repo, are not executed by the bot, and are TradingView-side only. Don't expect them in `git status`, and don't wire them into the bot.
 - `vwap_strategy.pine` (1438 lines, the main strategy, v5) and `vwap_rhythm.pine` / `vwap_angle.pine` (supporting indicators) share the same anchor system (Session/Week/…/Year) and stdev-band VWAP structure. `vwap_strategy.pine` has MTF/HTF filters, hedge mode, pyramiding, equity protector, and limit entries at stdev bands.
 - The strategy fires alerts via `alert_message = uuid_entrylong/uuid_exitlong/uuid_entryshort/uuid_exitshort` — opaque UUID strings set in the "Alert Message IDs" inputs group (TradingView alert setup is expected to wrap them in the JSON the webhook expects). The bot's webhook payload contract lives in `models.py`/README: `secret`, `exchange`, `symbol`, `side`, `size_usdt`, optional `leverage`, `take_profit`, `stop_loss`, `trailing_stop`, `trailing_activation_pct`, `request_id` (idempotency key).
