@@ -9,6 +9,7 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 - `tests/test_hyperliquid_testnet.py` hits the **Hyperliquid testnet API** (orders, cancels, TP/SL) and is skipped when `HYPERLIQUID_PRIVATE_KEY` is unset; it forces the testnet override itself, so it never touches a live account
 - Testnet USDC (faucet funds) is **finite** and spot round trips on testnet burn it (degenerate books: ETH spot bid ~50 vs ask ~150, no XAU, BTC spot is whole-BTC lots). Prefer **perps** for testnet functional tests, and use only **minimal amounts** everywhere (just above the 10 USDC min order value).
 - No linter/typecheck config exists. `.venv` uses Python 3.14; README claims 3.10+.
+- Pine syntax gate: `tools/openpinescript` (one-time build: `cd tools/openpinescript && npm ci --ignore-scripts && npm run build`); it is not a TradingView-parity backtester — see Local Pine tooling.
 
 ## Env / config gotchas
 
@@ -48,18 +49,34 @@ TradingView webhook bot: receives TradingView (Pine Script) alerts as JSON at `P
 - Daily PnL comes from `fetch_my_trades` `info.closedPnl`, cached 60 s per UTC day (`_PNL_CACHE`).
 - TP/SL are **market trigger orders** (`{"stopLossPrice": ..., "reduceOnly": True}` / `{"takeProfitPrice": ...}`), not limit orders; trigger prices are tick-rounded, and `fetch_open_orders` exposes them via `order["triggerPrice"]`.
 
-## PineScript (strategies/*.pine)
+## PineScript (indicators/ and strategies/)
 
-- Docs: https://www.tradingview.com/pine-script-docs/ (Pine v5 language reference — `strategy.entry/close/exit`, `alert_message`, `request.*` calls, `timeframe.change`). No sitemap (checked robots.txt → global `sitemap.xml` only lists the docs root; index the nav tree instead). The default docs are **v6**; repo scripts are `//@version=5`, so prefix URLs with `/pine-script-docs/v5/...`.
+- Docs: https://www.tradingview.com/pine-script-docs/ (Pine v5 language reference — `strategy.entry/close/exit`, `alert_message`, `request.*` calls, `timeframe.change`). No sitemap (checked robots.txt → global `sitemap.xml` only lists the docs root; index the nav tree instead). The default docs are **v6**; repo scripts are mostly `//@version=5`, so prefix URLs with `/pine-script-docs/v5/...` when needed. A local v6 docs corpus is in `tools/pinescriptv6` (see below) — use it as general Pine guidance, not v6-only.
 - Direct pages for concepts used by the strategies:
   - `strategy.entry/close/close_all/exit`, pyramiding, order placement → `/pine-script-docs/v5/concepts/strategies`
   - `alert_message`, `{{strategy.order.alert_message}}`, alert setup → `/pine-script-docs/v5/concepts/alerts`
   - `request.earnings/dividends/splits`, external data → `/pine-script-docs/v5/concepts/other-timeframes-and-data`
   - `timeframe.change`, MTF/HTF → `/pine-script-docs/v5/concepts/timeframes`; sessions/time → `/pine-script-docs/v5/concepts/sessions`, `/pine-script-docs/v5/concepts/time`
   - Execution model (`barstate.*`, calc on every tick) → `/pine-script-docs/v5/language/execution-model`
-  - `input.*` (incl. the "Alert Message IDs" group) → `/pine-script-docs/v5/concepts/inputs`
+  - `input.*` → `/pine-script-docs/v5/concepts/inputs`
   - Built-in function reference (`fun_strategy.entry`, `fun_ta.vwap`, …) → https://www.tradingview.com/pine-script-reference/v5/
-- `strategies/` is **gitignored** (`*.pine`) — these files are not part of the repo, are not executed by the bot, and are TradingView-side only. Don't expect them in `git status`, and don't wire them into the bot.
-- `vwap_strategy.pine` (1438 lines, the main strategy, v5) and `vwap_rhythm.pine` / `vwap_angle.pine` (supporting indicators) share the same anchor system (Session/Week/…/Year) and stdev-band VWAP structure. `vwap_strategy.pine` has MTF/HTF filters, hedge mode, pyramiding, equity protector, and limit entries at stdev bands.
-- The strategy fires alerts via `alert_message = uuid_entrylong/uuid_exitlong/uuid_entryshort/uuid_exitshort` — opaque UUID strings set in the "Alert Message IDs" inputs group (TradingView alert setup is expected to wrap them in the JSON the webhook expects). The bot's webhook payload contract lives in `models.py`/README: `secret`, `exchange`, `symbol`, `side`, `size_usdt`, optional `leverage`, `take_profit`, `stop_loss`, `trailing_stop`, `trailing_activation_pct`, `request_id` (idempotency key).
-- Pine scripts are edited as text only; there is no local compiler/backtester here.
+- Layout: `indicators/` holds TradingView-side indicators, `strategies/` holds strategies; neither is executed by the bot. Pine files are tracked in git (not ignored). The vwap strategies embed the webhook `secret` — keep it in sync with `WEBHOOK_SECRET` in `.env` and treat it as sensitive.
+- `indicators/vwap.pine` is TradingView's own VWAP indicator and the canonical reference for the shared anchor/stdev-band structure. Its `[_vwap, _stdevUpper, _] = ta.vwap(src, isNewPeriod, 1)` (indicators/vwap.pine:67) is valid Pine v5 and must NOT be "fixed" for OpenPineScript (which only implements single-return `ta.vwap`; see Local Pine tooling).
+- `indicators/vwap_angle.pine` / `indicators/vwap_rhythm.pine` are supporting indicators on the same anchor system; their logic is embedded (with plots omitted) as optional filters in `strategies/vwap_swing.pine`.
+- `indicators/cot_index_v2.pine` / `cot_comm_net_v2.pine` / `cot_noncomm_net_v2.pine` / `cot_retail_net_v2.pine` are **Pine v6** (unlike the v5 strategies — user preference for these): reconstructions of the invite-only "COT ... by OTC" indicators. They import `TradingView/LibraryCOT/6` (`getCFTCCode()` + `COTTickerid()` to build `COT:<code>_<F|FO>_<metric>_<direction>` tickers) and request the weekly COT metrics at daily resolution with `nz(daily, weekly)` fallback so Friday releases show on the forming weekly bar. Pine has no `coalesce()` in v5 or v6 (CE10271) — use `nz()`.
+- `indicators/true_seasonality.pine` and `indicators/valuation_tool.pine` are Pine v6 reconstructions of invite-only OTC indicators (screenshots live alongside them in `indicators/`).
+- `strategies/vwap_strategy.pine` (v4.84, ~946 lines) is the accumulation/distribution strategy: core VWAP bounces/crosses/limit entries and TPs, optional HTF VWAP filter, equity protector, pyramiding; HeikinAshi/CVD were removed in the split.
+- `strategies/vwap_swing.pine` (v1.00, ~1286 lines) is the swing variant: full HA/CVD core, optional vwap_angle filters (Alignment/Imbalance/Balance), optional vwap_rhythm filters (Not Extended/VWAP Side/Inside 1st Band), and a stop-loss (VWAP band or percent; band stop can track live or freeze at entry).
+- `strategies/12-month-rule.pine` is a monthly sleeve-timing strategy.
+- Alerts: `vwap_strategy.pine` / `vwap_swing.pine` build the webhook JSON in `msg()` / `msgEntryLong()` etc. with the same contract as the bot (`secret`, `exchange`, `symbol`, `side`, `size_usdt`, `request_id`; see `models.py`/README). `secret` must match `WEBHOOK_SECRET` in `.env`.
+- Pine scripts are edited as text; use `tools/openpinescript` as a local syntax gate, but TradingView is the final compile/parity check — there is no local TradingView-parity backtester.
+
+## Local Pine tooling
+
+- `tools/openpinescript/` — OpenPineScript (GPL-3.0): a real Pine v1–v5 transpiler/runtime, used as a **local syntax gate**, not as a parity backtester. Build once: `cd tools/openpinescript && npm ci --ignore-scripts && npm run build` (Node ≥20; `--ignore-scripts` skips its `prepare` parser generation; `npm run build` regenerates the parsers and builds). Validate with `compileScript()` / `Session.compile()`; the CLI additionally needs an OHLCV CSV.
+- Known OpenPineScript engine gaps (valid Pine it rejects; work around only inside the gate, never in the `.pine` files):
+  - `ta.vwap` is single-return in OpenPineScript; the valid v5 tuple form is in `indicators/vwap.pine:67`.
+  - `strategy.max_drawdown_percent` (used in the stats table) is not implemented.
+  - With those two substitutions, both vwap strategies transpile as v5 (77 KB / 115 KB JS). Remaining diagnostics are syntax hints, not TradingView parity.
+- `tools/pinescriptv6/` — markdown Pine reference corpus restructured for LLM/RAG use; treat it as **general Pine guidance, not v6-only**. Docs only, no code; license/redistribution is unclear, so reference use only.
+- Both are nested git clones. Do not `git add` them as-is (git stages gitlinks); remove their `.git` to vendor them, or register submodules. Keep OpenPineScript a separate GPL-3.0 tool; do not copy its code into this repo without complying.
